@@ -7,10 +7,22 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Returns true if password found, else returns false
-func searchPasswordInFile(password string, filename string) bool {
+func searchPasswordInFile(password string, fileNumber byte, priority byte) byte {
+	fileNumberString := strconv.Itoa(int(fileNumber))
+	filename := ""
+	if priority == 1 {
+		filename = "slave_files/passwords_" + string(fileNumberString) + ".txt"
+	} else if priority == 2 {
+		filename = "extra_files1/passwords_" + string(fileNumberString) + ".txt"
+	} else if priority == 3 {
+		filename = "extra_files2/passwords_" + string(fileNumberString) + ".txt"
+	}
+
+	fmt.Println("Searching "+password+" in ", filename)
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -20,12 +32,19 @@ func searchPasswordInFile(password string, filename string) bool {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
+		// TODO
+		//passwords_8.txt not being scanned completely
+		if fileNumber == 8 {
+			//fmt.Println(scanner.Text())
+		}
+
 		if scanner.Text() == password {
-			return true
+			fmt.Println(password+" found in file ", filename)
+			return 1
 		}
 	}
 
-	return false
+	return 0
 }
 
 // Returns file numbers of password files present in given directory
@@ -39,7 +58,6 @@ func getFileNumbersFromDirectory(directoryName string) []byte {
 	startNameSplit := len("passwords_")
 	endNameSplit := len(".txt")
 	for _, file := range files {
-		fmt.Println(file.Name())
 		fileNumberString := file.Name()[startNameSplit : len(file.Name())-endNameSplit]
 		fileNumber, err := strconv.Atoi(fileNumberString)
 		if err != nil {
@@ -52,17 +70,58 @@ func getFileNumbersFromDirectory(directoryName string) []byte {
 	return fileNumbers
 }
 
-func main() {
-	// Below code for searching password in files
-	// passwordFound := searchPasswordInFile("!!!123blahblah!", "slave_files/passwords_1.txt")
-	// fmt.Println("Password found: ", passwordFound)
+func receiveSearchRequests(conn net.Conn) {
+	// 1st byte of buffer tells type of message
+	//searchFileCommand, quitSearchCommand, heartbeatCommand := 1, 2, 3
 
+	buf := make([]byte, 100)
+
+	for {
+		// getting search request from server
+		_, err := conn.Read(buf)
+		fmt.Println("Receiving search request")
+
+		if err != nil {
+			fmt.Println(err)
+			// continue
+		}
+
+		searchFileCommand := buf[0]
+		priority := buf[1]
+		fileNumber := buf[2]
+		lenPassword := buf[3]
+		passwordToSearch := string(buf[4 : lenPassword+4])
+
+		searchResult := searchPasswordInFile(passwordToSearch, fileNumber, priority)
+
+		if searchResult == 0 {
+			fmt.Println("Password NOT found in file: ", fileNumber)
+		} else if searchResult == 1 {
+			fmt.Println("Password ***FOUND*** in file: ", fileNumber)
+		}
+
+		buf[0] = searchFileCommand
+		// searchResult == 0(notFound), 1(found), 2(error)
+		buf[1] = searchResult
+
+		// sending searchResult to server
+		_, err = conn.Write(buf)
+		if err != nil {
+			fmt.Println(err)
+			// continue
+		}
+
+	}
+
+}
+
+func main() {
+	// allFiles present with the slave node
 	allFiles := make([][]byte, 3)
 	// Reading numbers of files in slice
 	allFiles[0] = getFileNumbersFromDirectory("slave_files")
 	allFiles[1] = getFileNumbersFromDirectory("extra_files1")
 	allFiles[2] = getFileNumbersFromDirectory("extra_files2")
-	fmt.Println("All file numbers", allFiles)
 
 	conn, err := net.Dial("tcp", "localhost:5555")
 	if err != nil {
@@ -76,7 +135,7 @@ func main() {
 	// First byte to server will tell it length of each fileNumbersArray. fileNumbersArray declared in below for loop
 	arrayToSend := []byte{byte(numberOfFiles)}
 
-	// writing fileNumbers at 0, 1, 2. 0 == slave_files, 1 == extra_files1, 2 == extra_files2
+	// writing fileNumbers at 0, 1, 2.    0 == slave_files, 1 == extra_files1, 2 == extra_files2
 	for _, fileNumbersArray := range allFiles {
 		//arrayToSend := make([]byte, numberOfFiles)
 		temp := make([]byte, numberOfFiles)
@@ -84,9 +143,16 @@ func main() {
 		arrayToSend = append(arrayToSend, temp...)
 	}
 
-	conn.Write(arrayToSend)
+	// informing server about files present with array
 	fmt.Println("Sent array: ", arrayToSend)
+	conn.Write(arrayToSend)
+
+	// receives search requests from server
+	go receiveSearchRequests(conn)
 
 	// conn should not close
-	conn.Close()
+	//conn.Close()
+
+	//prevent slave from exiting
+	time.Sleep(500 * time.Second)
 }

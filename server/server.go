@@ -6,6 +6,9 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strconv"
+	"sync"
+	"time"
 )
 
 // Page is an html page
@@ -26,6 +29,8 @@ func loadPage(title string) (*Page, error) {
 
 // Slave contains informaion about a slave node
 type Slave struct {
+	// to take control of slave, mux.lock
+	mux         sync.Mutex
 	isAvailable bool // is slave available for work
 	conn        net.Conn
 	allFiles    [][]byte //0 index = numbers of slaves own files. 1 & 2 index have numbers of extra files.
@@ -84,8 +89,19 @@ func makeNewSlave(conn net.Conn) (*Slave, error) {
 	return &slave, nil
 }
 
+// addSlave adds a slave in slave array
+func addSlave(slaves []*Slave, slave *Slave) {
+	for index := range slaves {
+		if slaves[index] == nil {
+			slaves[index] = slave
+			break
+		}
+
+	}
+}
+
 // slaveManager communicates with new slave about files info then adds slave to slaves
-func slaveManager(slaves []Slave, newSlavesChannel chan net.Conn) {
+func slaveManager(slaves []*Slave, newSlavesChannel chan net.Conn) {
 
 	for {
 		select {
@@ -98,8 +114,9 @@ func slaveManager(slaves []Slave, newSlavesChannel chan net.Conn) {
 			}
 
 			//append slave to all slaves
-			slave := *slavePointer
-			slaves = append(slaves, slave)
+			//slave := *slavePointer
+			addSlave(slaves, slavePointer)
+			//slaves = append(slaves, slave)
 			fmt.Println("All Slaves", slaves)
 
 		default:
@@ -141,7 +158,6 @@ func (nch *newClientHandler) ServeHTTP(writer http.ResponseWriter, reader *http.
 
 	// a response written to the client
 	fmt.Fprintf(writer, "Hi there, I am searching for your password "+passToSearch+" %s!", reader.URL.Path[1:])
-	fmt.Fprintf(writer, "Yo yo yo "+passToSearch+" %s!", reader.URL.Path[1:])
 }
 
 // Sends a form to web client to enter password into.
@@ -168,12 +184,201 @@ func clientListener(ncc chan Client) {
 }
 
 // clientManager receives newClient that are added into newClientsChannel by newClientHandler
-func clientManager(clients []Client, newClientsChannel chan Client) {
+func clientManager(clients []Client, newClientsChannel chan Client, slaves []*Slave, chanForStatusShower chan []byte) {
 	for {
 		select {
 		case newClient := <-newClientsChannel:
 			clients = append(clients, newClient)
+
+			go searchPasswordForClient(newClient, slaves, chanForStatusShower)
 			fmt.Println("All clients : ", clients)
+		}
+	}
+}
+
+// checks if all files present have been searched for password
+func allSearched(searchedStatusOfFiles []byte) bool {
+	//notSearching := byte(0)
+	//searching := byte(1)
+	searched := byte(2)
+
+	for _, status := range searchedStatusOfFiles {
+		if status != searched {
+			return false
+		}
+	}
+
+	return true
+}
+
+// return filesToSearch and needToSearch
+func getFilesToSearch(searchedStatusOfFiles []byte, slave *Slave, priority int) ([]byte, bool) {
+	// filenumber of files in a slaves folder. Three folders at each slave node
+	fileNumbers := slave.allFiles[priority-1]
+
+	notSearching := byte(0)
+	searching := byte(1)
+	//searched := byte(2)
+	filesToSearch := make([]byte, 0)
+	needToSearch := false
+
+	// cheking for fileNumbers that have not been searched
+	for _, fileNumber := range fileNumbers {
+		// File number should start with 1
+		if fileNumber == 0 {
+			continue
+		}
+
+		if searchedStatusOfFiles[fileNumber] == notSearching {
+			filesToSearch = append(filesToSearch, fileNumber)
+			searchedStatusOfFiles[fileNumber] = searching //will tell slave to search when this function returns
+			needToSearch = true
+		}
+	}
+
+	return filesToSearch, needToSearch
+
+}
+
+func searchFilesInSlave(slave *Slave, filesToSearch []byte, searchedStatusOfFiles []byte, passwordToSearch string, priority int) {
+	// Ignore : returns passwordFound, errorWhileSearching
+	//notSearching, searching, searched := byte(0), byte(1), byte(2)
+	notSearching, searched := byte(0), byte(2)
+	// locking slave so only this functin can communicate with slave
+	slave.mux.Lock()
+	slave.isAvailable = false
+	defer slave.mux.Unlock()
+
+	// 1st byte of buffer tells type of message
+	//searchFileCommand, quitSearchCommand, heartbeatCommand := 1, 2, 3
+	searchFileCommand := byte(1)
+
+	buf := make([]byte, 100)
+	lenPassword := byte(len(passwordToSearch))
+	conn := slave.conn
+
+	// for all files to search
+	for _, fileNumber := range filesToSearch {
+		// passwrod and fileToSearc information to be sent to slave
+		buf[0] = searchFileCommand
+		buf[1] = byte(priority)
+		buf[2] = fileNumber
+		buf[3] = lenPassword
+		copy(buf[4:lenPassword+4], []byte(passwordToSearch))
+
+		// writing information for searchin to slave
+		_, err := conn.Write(buf)
+		if err != nil {
+			fmt.Println(err)
+			searchedStatusOfFiles[fileNumber] = notSearching
+			continue
+		}
+
+		// reading search response from slave
+		_, err = conn.Read(buf)
+		if err != nil {
+			fmt.Println(err)
+			searchedStatusOfFiles[fileNumber] = notSearching
+			continue
+		}
+
+		// extracting search response from slave
+		if buf[0] == searchFileCommand {
+			searchResult := buf[1] // searchResult == 0(notFound), 1(found), 2(error)
+			notFound, found := byte(0), byte(1)
+
+			if searchResult == notFound {
+				searchedStatusOfFiles[fileNumber] = searched
+			} else if searchResult == found {
+				searchedStatusOfFiles[fileNumber] = searched
+
+				// TODO : other action for stopping all search
+			}
+		}
+
+	}
+
+	// slave is availabel again
+	slave.isAvailable = true
+}
+
+// searches password for client
+func searchPasswordForClient(client Client, slaves []*Slave, chanForStatusShower chan []byte) {
+	passwordToSearch := client.passwordToSearch
+
+	// TODO: change IF total number of files change
+	// +1 so easy comparison of index with file numbers
+	totalNumberOfFiles := 57 + 1
+
+	// files searced contains true for files searched. For file_1 index == 1 in slice
+	// 0 == not searching, 1 == searching, 2 == searched
+	notSearching := byte(0)
+	searching := byte(1)
+	//searched := byte(2)
+	searchedStatusOfFiles := make([]byte, totalNumberOfFiles) //initally all are 0
+
+	// statusShower periodically prints this to console
+	chanForStatusShower <- searchedStatusOfFiles
+
+	// while all files not searched for password
+	for !allSearched(searchedStatusOfFiles) {
+		// if priority == 1, all slaves priority 1 files are searched
+		for priority := 1; priority <= 3; priority++ {
+			// loop over all slaves
+			for _, slavePointer := range slaves {
+				// slavePointer == nil means slave not assigned in array at that index
+				if slavePointer == nil {
+					continue
+				}
+
+				// Ignore: slave := *slavePointer
+				// if slave.isAvailable then mutex is not locked for slave
+				if (*slavePointer).isAvailable {
+					// needToSearch is true if slave has files in which password has not been searched.
+					//  FilesToSearch are file numbers to search in slave
+					filesToSearch, needToSearch := getFilesToSearch(searchedStatusOfFiles, slavePointer, priority)
+
+					if needToSearch == true {
+						//Todo :
+						// searchFilesInSlave automatically updates searchedStatusOfFiles. (Conflicts?)
+						go searchFilesInSlave(slavePointer, filesToSearch, searchedStatusOfFiles, passwordToSearch, priority)
+						//passwordFound, errorWhileSearching := searchFilesInSlave(slave, filesToSearch, searchedFiles, priority)
+					}
+
+				}
+			}
+		}
+
+		// may sleep a little before resetting. Sleep()
+		// resetting status of files that are being searched to not_searching
+		// gap before scanning all slaves again.
+		time.Sleep(2 * time.Second)
+		for index, status := range searchedStatusOfFiles {
+			if status == searching {
+				searchedStatusOfFiles[index] = notSearching
+			}
+		}
+	}
+
+}
+
+// statusShower periodically shows status of searched files for a clients
+func statusShower(chanForStatusShower chan []byte) {
+	allStatuses := make([][]byte, 0)
+
+	for {
+		select {
+		case searchedStatusOfFiles := <-chanForStatusShower:
+			allStatuses = append(allStatuses, searchedStatusOfFiles)
+
+		default:
+			// loop and print all statuses
+			for index, searchedStatusOfFiles := range allStatuses {
+				// not_searching = 0, searching = 1, searched = 2
+				fmt.Println("Client_"+strconv.Itoa(index+1)+" status: ", searchedStatusOfFiles)
+			}
+
+			time.Sleep(2 * time.Second)
 		}
 	}
 }
@@ -181,7 +386,7 @@ func clientManager(clients []Client, newClientsChannel chan Client) {
 func main() {
 
 	// contain all registered slaves
-	slaves := make([]Slave, 0)
+	slaves := make([]*Slave, 10)
 	// contain all current clients
 	clients := make([]Client, 0)
 
@@ -195,23 +400,36 @@ func main() {
 	// slaveManager receives a new conn from newSlavesChannel and uses it to populate a new slave struct. Then adds it to slaves
 	go slaveManager(slaves, newSlavesChannel)
 
+	// shows state of search for all clients
+	chanForStatusShower := make(chan []byte)
+
 	// clientListener runs http server. Handles incoming requests concurrently.
 	// new clients formed are inserted into newClientsChannel
 	go clientListener(newClientsChannel)
 	// clientManager receives new client from newClientsChannel and appends to clients
-	go clientManager(clients, newClientsChannel)
+	go clientManager(clients, newClientsChannel, slaves, chanForStatusShower)
+
+	go statusShower(chanForStatusShower)
 
 	// stopping main from quitting
-	for {
-
-	}
+	time.Sleep(500 * time.Second)
 
 }
 
 /* Look into:
-1) Instead of creating a slice of 0 len and appending slaves, create a slice of some length
+1) How to update slaves array so no conflict occurs. Add, delete slave
+
+2) How to update searchedStatusOfFiles so no conflict occurs
+
+3) Concurrency in slave
+
+*) Solved
+Instead of creating a slice of 0 len and appending slaves, create a slice of some length
 and add new slaves on empty positions. Then if a slice passed to function, that function will know
 the lengt of the slice and can loop over it.
+Solution : created a slice of particular length and passed. Every one can loop over slice of same length
+
+
 
 
 
